@@ -1264,7 +1264,9 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 }
 ```
 
-配方包含：`baseUrl`（必须 HTTPS，本地开发可用回环 HTTP；拒绝内嵌凭据、代理递归路径与任意 query 参数）；`api`（`openai` | `anthropic` | `responses` | `google` 四选一，决定线上协议并从 `baseUrl` 推导请求路径）；恰好一个凭据引用 —— `apiKeyEnv: "变量名"`（调用时读环境变量）或 `credentialRef: "名字"`（通过 Web UI 存储的值）；以及 `models` 表，每个模型可设 `contextWindow`（默认 128000）、`outputTokens`（默认 `min(8192, 窗口/4)`）、`stream`（默认 false）。配方也可以像 URL 条目一样拆成 `recipe`/`bind` 路由形态；具名条目未绑定时对路由不生效（routing-inert）。
+配方包含：`baseUrl`（必须 HTTPS，本地开发可用回环 HTTP；拒绝内嵌凭据、代理递归路径与任意 query 参数）；`api`（`openai` | `anthropic` | `responses` | `google` 四选一，决定线上协议并从 `baseUrl` 推导请求路径）；恰好一个凭据引用 —— `apiKeyEnv: "变量名"`（调用时读环境变量）或 `credentialRef: "名字"`（通过 Web UI 存储的值）；以及 `models` 表，每个模型可设 `contextWindow`（默认 128000）、`outputTokens`（默认 `min(8192, 窗口/4)`）、`stream`（默认 false）、`reasoning`（默认不设，见下）。配方也可以像 URL 条目一样拆成 `recipe`/`bind` 路由形态；具名条目未绑定时对路由不生效（routing-inert）。
+
+`reasoning` 用于关闭该模型摘要请求的思考（#2666）。默认会思考的摘要模型会把输出预算花在推理上：回复以 `length` 结束、没有摘要正文，每次折叠都失败。`"off"` 发送协议自身的控制字段 —— `reasoning_effort: "none"`（openai）、`reasoning: {effort: "none"}`（responses）、`thinking: {type: "disabled"}`（anthropic）、`generationConfig.thinkingConfig: {thinkingBudget: 0}`（google）。`"template-off"` 改为发送 `chat_template_kwargs: {enable_thinking: false}`，适用于渲染 chat template 的 openai 兼容服务（vLLM、SGLang、运行 Qwen 系模型的 llama.cpp），要求 `api: "openai"`。该字段需显式开启，因为严格的上游会拒绝不认识的字段；不设时请求体保持不变。
 
 每条链最多 16 个目标。通过 Web API 保存启用的链时会校验每个引用可解析（未知 provider 或 model → HTTP 400）。运行时遇到不可解析的引用会记录一次警告并禁用整条链直至修复 —— 绝不会回退用主模型写摘要。`secret:` 值单独存储在私有的 `billion-context.json.summary-credentials.json` 文件中，不随主 JSON 配置下发，配置 API 也不会返回。Windows 上请用仅管理员的 ACL 保护该文件及其父目录；确认没有代理进程在写存储后，残留的 `.lock` 文件需手工删除。总预算由全部目标与压缩入口共享；取消或会话状态变化会丢弃已生成但未落盘的结果。代理端插件桥（dsh / pi / opencode / codex MCP）会把每次 `compress` 调用的 HTTP 等待时间设为 `totalTimeoutMs` 加少量开销余量 —— 启动时从代理学习得到 —— 因此调高该预算不会再让长折叠被隐藏的 60 秒客户端超时截断（#2652）。
 

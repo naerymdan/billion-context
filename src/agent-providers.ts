@@ -1,5 +1,5 @@
 import type { NamedProviderRecipe } from "./config.js";
-import { validSummaryCredentialName } from "./external-summary-settings.js";
+import { parseSummaryReasoning, validSummaryCredentialName, type SummaryReasoning } from "./external-summary-settings.js";
 import { plainHttpTrusted } from "./private-host.js";
 import { allowPrivateHttpProviders } from "./knobs.js";
 
@@ -72,13 +72,13 @@ function parseAgentProviderEntry(name: string, value: unknown): AgentProviderRec
     if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
         || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error(`Provider "${name}" baseUrl must be HTTPS (or loopback HTTP) without credentials or proxy recursion`);
     if (!recipe.models || typeof recipe.models !== "object" || Array.isArray(recipe.models)) throw new Error(`Provider "${name}" needs a models object`);
-    const models = recipe.models as Record<string, { contextWindow?: unknown; outputTokens?: unknown; stream?: unknown }>;
+    const models = recipe.models as Record<string, { contextWindow?: unknown; outputTokens?: unknown; stream?: unknown; reasoning?: unknown }>;
     const modelEntries = Object.entries(models);
     if (modelEntries.length === 0 || modelEntries.length > 64) throw new Error(`Provider "${name}" needs 1 to 64 models`);
     const outModels: NamedProviderRecipe["models"] = {};
     for (const [model, knobs] of modelEntries) {
         if (model.length === 0 || model.length > 200) throw new Error(`Provider "${name}" has an invalid model name`);
-        const parsed: { contextWindow?: number; outputTokens?: number; stream?: boolean } = {};
+        const parsed: { contextWindow?: number; outputTokens?: number; stream?: boolean; reasoning?: SummaryReasoning } = {};
         if (knobs.contextWindow !== undefined) {
             if (typeof knobs.contextWindow !== "number" || !Number.isSafeInteger(knobs.contextWindow) || knobs.contextWindow < 2048 || knobs.contextWindow > 10_000_000) throw new Error(`Provider "${name}" model "${model}" has an invalid contextWindow`);
             parsed.contextWindow = knobs.contextWindow;
@@ -91,6 +91,8 @@ function parseAgentProviderEntry(name: string, value: unknown): AgentProviderRec
             if (typeof knobs.stream !== "boolean") throw new Error(`Provider "${name}" model "${model}" has an invalid stream flag`);
             parsed.stream = knobs.stream;
         }
+        const reasoning = parseSummaryReasoning(knobs.reasoning, recipe.api, `Provider "${name}" model "${model}"`);
+        if (reasoning !== undefined) parsed.reasoning = reasoning;
         outModels[model] = parsed;
     }
     return { baseUrl: recipe.baseUrl.replace(/\/+$/, ""), api: recipe.api as NamedProviderRecipe["api"], apiKey: recipe.apiKey, models: outModels };

@@ -5,6 +5,27 @@ import type { PreflightProtocol } from "./preflight.js";
 import { plainHttpTrusted } from "./private-host.js";
 import { allowPrivateHttpProviders } from "./knobs.js";
 
+/** #2666: summary-lane thinking control, per recipe model. A summary target
+ *  that thinks by default spends its output budget on reasoning (finish
+ *  reason "length", empty content) and every fold fails. Opt-in, because
+ *  strict upstreams reject fields they do not know:
+ *  - "off": the protocol's own control (openai `reasoning_effort: "none"`,
+ *    responses `reasoning.effort: "none"`, anthropic `thinking.type:
+ *    "disabled"`, google `thinkingConfig.thinkingBudget: 0`);
+ *  - "template-off": `chat_template_kwargs.enable_thinking: false`, for
+ *    openai-compatible servers that render a chat template (vLLM, SGLang,
+ *    llama.cpp serving Qwen-family models). openai api only. */
+export type SummaryReasoning = "off" | "template-off";
+
+/** Validate a `reasoning` knob against the target's protocol. THROWS with
+ *  `where` naming the offending entry; undefined means "send nothing". */
+export function parseSummaryReasoning(value: unknown, protocol: string, where: string): SummaryReasoning | undefined {
+    if (value === undefined) return undefined;
+    if (value !== "off" && value !== "template-off") throw new Error(`${where} reasoning must be "off" or "template-off"`);
+    if (value === "template-off" && protocol !== "openai") throw new Error(`${where} reasoning "template-off" needs api "openai" (it sets chat_template_kwargs)`);
+    return value;
+}
+
 interface ExternalSummaryTarget {
     name: string;
     protocol: PreflightProtocol;
@@ -20,6 +41,7 @@ interface ExternalSummaryTarget {
     contextWindow: number;
     outputTokens: number;
     stream: boolean;
+    reasoning?: SummaryReasoning;
 }
 
 export interface ExternalSummarySettings {
@@ -210,9 +232,10 @@ export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes:
         const outputTokens = integer(knobs.outputTokens, Math.min(8192, Math.floor(contextWindow / 4)), 128, contextWindow - 1);
         if (knobs.stream !== undefined && typeof knobs.stream !== "boolean") throw new Error("External summary stream must be boolean");
         const stream = knobs.stream === true;
+        const reasoning = parseSummaryReasoning(knobs.reasoning, recipe.api, `External summary target "${ref}"`);
         const inlineKey = recipe.apiKey;
         const credentialRef = recipe.apiKeyEnv ? `env:${recipe.apiKeyEnv}` : `secret:${recipe.credentialRef}`;
-        return { name, protocol: recipe.api, url: derivedSummaryEndpoint(recipe, model, stream), model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream };
+        return { name, protocol: recipe.api, url: derivedSummaryEndpoint(recipe, model, stream), model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream, ...(reasoning !== undefined ? { reasoning } : {}) };
     });
     return { enabled: true, targets, budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET
         , ...(chain.concurrency !== undefined ? { concurrency: chain.concurrency } : {}), ...parseAutoFold(chain as unknown as Record<string, unknown>) };
@@ -263,7 +286,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
     const names = new Set<string>();
     const targets = values.map((value): ExternalSummaryTarget => {
         const target = object(value);
-        knownKeys(target, inlineKeys ? ["name", "protocol", "url", "model", "credentialRef", "apiKey", "contextWindow", "outputTokens", "stream"] : ["name", "protocol", "url", "model", "credentialRef", "contextWindow", "outputTokens", "stream"]);
+        knownKeys(target, inlineKeys ? ["name", "protocol", "url", "model", "credentialRef", "apiKey", "contextWindow", "outputTokens", "stream", "reasoning"] : ["name", "protocol", "url", "model", "credentialRef", "contextWindow", "outputTokens", "stream", "reasoning"]);
         const name = text(target.name, 64);
         if (!validSummaryCredentialName(name) || names.has(name)) throw new Error("External summary target names must be unique identifiers");
         names.add(name);
@@ -292,7 +315,8 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
             const suffix = target.stream === true ? "streamGenerateContent" : "generateContent";
             if (!url.pathname.endsWith(`/models/${encodeURIComponent(model.replace(/^models\//, ""))}:${suffix}`)) throw new Error("Google summary endpoint must match the model and stream mode");
         }
-        return { name, protocol, url: url.href, model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream: target.stream === true };
+        const reasoning = parseSummaryReasoning(target.reasoning, protocol, "External summary target");
+        return { name, protocol, url: url.href, model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream: target.stream === true, ...(reasoning !== undefined ? { reasoning } : {}) };
     });
     return { enabled: true, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
 }

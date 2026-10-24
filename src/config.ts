@@ -15,7 +15,7 @@ import { parseCompatDropFields } from "./compat-drop.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
-import { parseExternalSummaryChain, type ExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
+import { parseExternalSummaryChain, parseSummaryReasoning, type ExternalSummaryChain, type SummaryReasoning, validSummaryCredentialName } from "./external-summary-settings.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -1140,6 +1140,8 @@ interface NamedProviderModel {
     contextWindow?: number;
     outputTokens?: number;
     stream?: boolean;
+    /** #2666: summary-lane thinking control (see SummaryReasoning). */
+    reasoning?: SummaryReasoning;
 }
 
 /** Dialing recipe on a NAMED providers-table key (pi/opencode idiom): the
@@ -1177,12 +1179,13 @@ export function parseNamedProviderRecipe(value: unknown): NamedProviderRecipe {
     const models: Record<string, NamedProviderModel> = {};
     for (const [id, raw] of Object.entries(obj.models)) {
         const knobs = (raw && typeof raw === "object" && !Array.isArray(raw)) ? raw as Record<string, unknown> : {};
-        const unknown = Object.keys(knobs).filter((key) => !["contextWindow", "outputTokens", "stream"].includes(key));
+        const unknown = Object.keys(knobs).filter((key) => !["contextWindow", "outputTokens", "stream", "reasoning"].includes(key));
         if (unknown.length > 0) throw new Error(`unknown fields on recipe model "${id}" [${unknown.join(", ")}]`);
         if (knobs.contextWindow !== undefined && (typeof knobs.contextWindow !== "number" || !Number.isSafeInteger(knobs.contextWindow) || knobs.contextWindow < 2048 || knobs.contextWindow > 10_000_000)) throw new Error(`recipe model "${id}" contextWindow must be an integer in [2048, 10000000]`);
         if (knobs.outputTokens !== undefined && (typeof knobs.outputTokens !== "number" || !Number.isSafeInteger(knobs.outputTokens) || knobs.outputTokens < 128)) throw new Error(`recipe model "${id}" outputTokens must be an integer >= 128`);
         if (knobs.stream !== undefined && typeof knobs.stream !== "boolean") throw new Error(`recipe model "${id}" stream must be a boolean`);
-        models[id] = { ...(knobs.contextWindow !== undefined ? { contextWindow: knobs.contextWindow } : {}), ...(knobs.outputTokens !== undefined ? { outputTokens: knobs.outputTokens } : {}), ...(knobs.stream !== undefined ? { stream: knobs.stream } : {}) };
+        const reasoning = parseSummaryReasoning(knobs.reasoning, obj.api, `recipe model "${id}"`);
+        models[id] = { ...(knobs.contextWindow !== undefined ? { contextWindow: knobs.contextWindow } : {}), ...(knobs.outputTokens !== undefined ? { outputTokens: knobs.outputTokens } : {}), ...(knobs.stream !== undefined ? { stream: knobs.stream } : {}), ...(reasoning !== undefined ? { reasoning } : {}) };
     }
     return { baseUrl: obj.baseUrl.trim().replace(/\/+$/, ""), api: obj.api, ...(obj.apiKeyEnv !== undefined ? { apiKeyEnv: obj.apiKeyEnv } : {}), ...(obj.credentialRef !== undefined ? { credentialRef: obj.credentialRef } : {}), models };
 }

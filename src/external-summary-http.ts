@@ -8,6 +8,7 @@ import { maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 import { finalizeSseLineEndings } from "./sse-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
+import type { SummaryReasoning } from "./external-summary-settings.js";
 
 /** #3488: bounded retry budget for one candidate call. Total dispatches
  *  (initial + retries). Retries fire ONLY on transient verdicts and must fit
@@ -88,6 +89,7 @@ export interface SummaryHttpTarget {
     readonly stream?: boolean;
     readonly contextWindow?: number;
     readonly outputTokens?: number;
+    readonly reasoning?: SummaryReasoning;
     readonly proxyUrl?: string;
     /** #2760: stable conversation id, stamped as x-opencode-session on OpenCode Go targets only. */
     readonly sessionId?: string;
@@ -184,6 +186,24 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
     return summary;
 }
 
+/** #2666: write the configured thinking control into a summary payload. A
+ *  no-op without the knob, so an unconfigured target's body is unchanged. */
+export function applySummaryReasoning(payload: Record<string, unknown>, protocol: PreflightProtocol, reasoning: SummaryReasoning | undefined): void {
+    if (reasoning === undefined) return;
+    if (reasoning === "template-off") {
+        payload.chat_template_kwargs = { ...(record(payload.chat_template_kwargs) ?? {}), enable_thinking: false };
+        return;
+    }
+    if (protocol === "openai") payload.reasoning_effort = "none";
+    else if (protocol === "responses") payload.reasoning = { effort: "none" };
+    else if (protocol === "anthropic") payload.thinking = { type: "disabled" };
+    else {
+        const generationConfig = record(payload.generationConfig) ?? {};
+        generationConfig.thinkingConfig = { thinkingBudget: 0 };
+        payload.generationConfig = generationConfig;
+    }
+}
+
 /** #2760: OpenCode Go (`opencode.ai/zen/go`) requires a stable x-opencode-session
  *  header for routing + prompt cache and answers HTTP 400 MissingSessionID without
  *  one. Matched on host + exact `/zen/go` or `/zen/go/...` so adjacent endpoints
@@ -232,6 +252,7 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                     payload[plan.protocol === "responses" ? "max_output_tokens" : "max_tokens"] = plan.outputTokens;
                 }
             }
+            applySummaryReasoning(payload, plan.protocol, plan.reasoning);
             // Reuse the existing codecs without carrying the main request's auth or
             // model. Bounded retry (#3488): transient verdicts (429/5xx/risk-control
             // body markers, fail-fast pre-response network deaths) re-dispatch up to
