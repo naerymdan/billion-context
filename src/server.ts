@@ -58,7 +58,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
-import { decideEaddrinuse, eaddrinuseExitCode, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
+import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -1387,7 +1387,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     server.on("error", (err: NodeJS.ErrnoException) => {
         let busyReason: FailFastReason | undefined;
         let peer: SameLanePeer | undefined;
-        if (err.code === "EADDRINUSE") {
+        if (isPortBusyError(err.code, lastTriedPort)) {
+            // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
+            // holder squats the IPv4 bind) as EACCES on an unprivileged port —
+            // classify it like a true EADDRINUSE so it ladders instead of dying
+            // with the misleading privileged-port hint.
             peer = classifySameLanePeer(listInstances(), lastTriedPort, launcherLane, ownFingerprint, (e) => sameInstanceShape(entryShape(e), ownShape));
             const action = decideEaddrinuse({
                 upgradeReplacement,
@@ -1414,14 +1418,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 const driftNote = peer?.kind === "drifted"
                     ? ` — held by a same-lane bili instance (pid ${peer.entry.pid}) whose config drifted since it spawned; it keeps serving its own sessions while this one takes the next free port`
                     : "";
-                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
+                log("warn", `port ${lastTriedPort} busy${err.code === "EADDRINUSE" ? "" : ` (${err.code})`} — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
                 attemptListen(action.nextPort);
                 return;
             }
             busyReason = action.reason;
         }
         const hint =
-            err.code === "EADDRINUSE"
+            isPortBusyError(err.code, lastTriedPort)
                 ? busyReason === "twin-collision"
                   ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
                   : busyReason === "upgrade-replacement"

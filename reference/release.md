@@ -41,8 +41,28 @@ The Agent does steps 1–6, the human does step 7 (merge).
    npm install --package-lock-only --ignore-scripts --no-fund --no-audit
    git diff --exit-code -- package-lock.json   # must be clean before you commit
    ```
-   CI enforces this with the `lock-sync` guard (`ci.yml`).
-4. **Add the release-notes entry — ONLY for severe releases (#1870, opt-in
+    CI enforces this with the `lock-sync` guard (`ci.yml`).
+ 3.5. **Sync plugin manifest versions (#4449)** — run on the release branch,
+    AFTER the bump commit, and commit the result as its own commit:
+    ```bash
+    node scripts/sync-codex-plugin-version.mjs
+    git add .agents .claude-plugin plugins/codex
+    git commit -m "chore: sync plugin manifests to v{VERSION}"
+    ```
+    Why: the four plugin manifests (`.agents/plugins/marketplace.json`,
+    `.claude-plugin/marketplace.json` + `.claude-plugin/plugin.json`,
+    `plugins/codex/.codex-plugin/plugin.json`) carry their own `version` fields —
+    Codex/Claude marketplaces detect updates by comparing that declared version
+    against the installed cache, so a stale manifest means "no update available"
+    forever for that lane. `package.json` is the single source of truth; the
+    script copies it into all four (idempotent — if nothing drifted the commit is
+    empty and you skip it). All three publish workflows run `--check` BEFORE
+    tag/publish (`release.yml` fails fast before any CI dispatch; `release-manual.yml`
+    syncs inside CI as part of its own release commit; `release-bugfix.yml` checks
+    the frozen carve-out head) — drift = red release, nothing shipped. A bugfix
+    carve-out PR head MUST therefore already carry the synced manifests (see the
+    carve-out process below).
+ 4. **Add the release-notes entry — ONLY for severe releases (#1870, opt-in
    since 2026-10-04)** — ordinary releases skip this step entirely and ship
    with NO entry. When a release IS severe, add the entry in the SAME release
    PR, as its own commit (never bundled into the release commit): prepend an
@@ -203,9 +223,10 @@ nothing else.
 **Process:**
 
 1. Cut the hotfix branch from the last released TAG (not master), apply ONLY the fix
-   plus the version bump (regenerate `package-lock.json` as in step 3 above; plus the
-   release-notes entry ONLY if the hotfix is severe — step 4 above), then push and
-   open a PR against master:
+   plus the version bump (regenerate `package-lock.json` as in step 3 above; sync the
+   plugin manifests as in step 3.5 above — the publish gate's `--check` runs against
+   this frozen head, so drift fails the whole lane; plus the release-notes entry ONLY
+   if the hotfix is severe — step 4 above), then push and open a PR against master:
    ```bash
    git checkout -b bugfix-release/v{VERSION}-{slug} v{LAST-RELEASED-TAG}
    ```
@@ -250,6 +271,113 @@ PR dance is slower than the fire.
 tree again). Master advances independently on its next normal release, which MUST be
 higher than the carve-out version (after v0.1.182 was cut off v0.1.181, the next
 normal release must be ≥ 0.1.183).
+
+## Dual-lane releases: the patch train (backport label bot)
+
+Operationalizes the carve-out channel from "one fix per branch" into a **standing
+patch train**, so small fixes ship fast WITHOUT blocking (or being blocked by)
+master's feature stream. Approved by the owner 2026-10-24.
+
+**The model:** master stays the single source of truth (features + big fixes merge
+there as always, nothing is frozen). In parallel, a `bugfix-release/**` train branch
+— cut from the last released TAG — accumulates small fixes as cherry-picks. A patch
+release ships the train (tag + that batch of fixes, strictly no unreleased features)
+via the existing carve-out channel; merging the train's ship PR brings the fixes and
+the version bump back into master. Version numbers stay one strictly-increasing
+stream (0.1.206 train, 0.1.207 feature, 0.1.208 train … all legal).
+
+**Which lane a fix takes** (the objective test is the cherry-pick, not an upfront
+opinion): if the fix applies cleanly onto the tag-based train and stands alone there
+→ small fix, fast lane. If it conflicts or depends on unreleased master work → slow
+lane, rides the next regular release. New features never take the train.
+
+**Mechanics:** the only manual steps are the label and the ship decision;
+cutting the train, backporting, and closing the cycle after ship are all
+automatic. The open train is **derived, never stored**: the newest
+`bugfix-release/*` branch whose BASE version is strictly above the latest
+`v*` tag (suffix stripped — `v0.1.206-train` counts as 0.1.206, so once the
+tag catches up the train auto-derives as closed). Cutting one = pushing such
+a branch; publishing one = the tag catching up. There is deliberately NO
+Actions variable pointing at it — GITHUB_TOKEN cannot read/write the
+actions-variables API (403 "Resource not accessible by integration"; no
+`permissions:` category grants it), which is exactly how the first,
+variable-based version of the bot failed on its maiden run.
+
+1. **Route a fix onto the train**: merge its PR to master as usual, with the
+   `backport` label set BEFORE clicking merge. `backport.yml` then:
+   - cuts a train automatically if none is open — `bugfix-release/v{NEXT}-train`
+     from the latest released `v*` tag (NEXT = patch+1) — and says so on the PR;
+   - cherry-picks the PR's own commits onto the train (merge-commit range
+     `merge^1..merge^2`, housekeeping merges inside the PR branch excluded via
+     `--no-merges`) and pushes;
+   - dispatches the CORE CI matrix on the train head (#772: token pushes carry
+     no push events) and leaves an audit comment.
+   Only MERGE-COMMIT merges are auto-backported (the repo convention):
+   squash/rebase merges rewrite the commit SHAs, and for a multi-commit rebase
+   picking just the final commit would silently ship a PARTIAL fix — the bot
+   refuses to guess and comments the manual command instead. No label → master
+   lane only, nothing lost (the bot says so on the PR). A cherry-pick conflict
+   is the objective "not a small fix" signal — the fix stays on master and the
+   bot comments the manual command. The workflow also has a manual dispatch
+   (`pr=<number>`) as the repair path — same merged+label gates — e.g. to
+   retry a backport after a workflow bug.
+2. **Ship the train** (the one owner decision — releases are owner-gated,
+    #2910): **Actions → "Release (one-click)" → Run workflow → tick `train`**.
+    That does the whole dance: derives the open train, checks it out,
+    drift-guards (train version must equal npm latest), adds the isolated
+    `release v{NEXT}` commit (package.json + lock only), pushes it to the train,
+    dispatches the FULL CI set at the train head, and opens the ship PR against
+    master with a generated changelog. You merge the PR; `release-bugfix.yml`
+    then publishes the PRE-MERGE head tree (tag + fixes) — and the fresh tag
+    closes the train cycle by derivation, so the next labeled merge cuts the
+    next train from it automatically. (Manual equivalent: release commit on
+    the train + push + ship PR against master, exactly like step 3 of the
+    normal process.)
+    ⚠ Severe fixes riding a train: include the release-notes entry (#1870) in
+    the fix PR itself, so the backport cherry-pick carries it onto the train —
+    the publish-time gate checks the entry ON THE REF, and the train's copy
+    otherwise lags at the base tag's.
+
+    **Ship-time audit (#4474)**: a conflicted backport leaves only a PR
+    comment — easy to miss, and CI green on the train head says nothing
+    about fixes that are ABSENT. Before opening the ship PR, the one-click
+    train run reconciles every backport-labeled merge since the train's base
+    tag against the cherry-pick `-x` trailers on the train. Any no-show is
+    rendered as a prominent ⚠️ section at the top of the ship PR body (it
+    never fails the run — you may legitimately ship without the straggler,
+    but you will see it before you merge).
+
+**Cutting / abandoning a train** (rarely needed — the bot cuts automatically):
+```bash
+# cut a train NOW (e.g. to stage it before the first labeled merge lands):
+git checkout -b bugfix-release/v{NEXT}-train v{LAST-RELEASED-TAG} && git push -u origin bugfix-release/v{NEXT}-train
+# abandon an open train (e.g. its fixes should ride the next regular release):
+git push origin --delete bugfix-release/v{NEXT}-train
+```
+
+**Known edge — a feature release overtakes an open train**: if a regular
+`*_release-v*` release ships a version ≥ the train's target while the train is
+ open, the fresh tag catches up to the train's base version and the train
+ AUTO-DERIVES AS CLOSED immediately (its ship PR would also fail release-bugfix's
+ strictly-newer-than-npm guard, by design). Resolution: delete the overtaken
+ branch (`git push origin --delete …`) and let the next labeled merge cut a fresh
+ train from the new tag — the bot does that automatically. (Rebasing the old
+ branch onto the new tag does NOT reopen it: derivation reads the base version
+ out of the branch NAME, which rebasing cannot change.) The fixes are never
+ lost — they are all on master too.
+
+**Why cherry-pick instead of merging the fix branch into the train:** the fix branch
+is based on master; a git merge into the tag-based train would carry every master
+commit since the tag over the merge-base — the exact feature leak the train exists
+to prevent. (This also means a "same commit SHA on both lines" dual-PR scheme is
+NOT possible in this model — the SHA-differing cherry-pick is the price of leak
+safety.)
+
+**CI wiring**: pushes to `bugfix-release/**` and PRs into a train run the CORE
+matrix (ci.yml trigger filters include the pattern); the FULL matrix at ship time
+comes from `release-bugfix.yml`'s all-lanes dispatch, same as the single-fix
+carve-out. Branch protection for `bugfix-release/**` (no force-push, no deletion)
+keeps trains from being rewritten mid-cycle.
 
 ## CI publish mechanism (what release.yml does)
 

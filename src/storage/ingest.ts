@@ -29,6 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
  * Field order of the hydration merge output — DERIVED from mergeState itself
@@ -87,61 +88,12 @@ export const ingestSerializations = { count: 0 };
  * reader (getMessages hydrates before returning) sees the verbatim original.
  * No media (or empty) → passthrough with the plain content hash.
  */
-/**
- * Media payloads below this size ride inline even inside raw sidecars —
- * splitting them costs a CAS row + a join for a few hundred bytes (#4069).
- */
-const MIN_MEDIA_URL_SPLIT_BYTES = 2048;
-/** data:<mime>;base64,<payload> with the payload swapped for its CAS hash. */
-const MEDIA_URL_MARKER_RE = new RegExp(
-    `data:([a-zA-Z0-9.+\\/-]+);base64,([A-Za-z0-9+/=]{${MIN_MEDIA_URL_SPLIT_BYTES},})`,
-    "g",
-);
-
-function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
-    let media: { hash: string; bytes: string }[] = [];
-    let split = content;
-    if (content.includes("\"imageBase64\"")) {
-        let parsed: { imageBase64?: unknown };
-        try {
-            parsed = JSON.parse(content) as { imageBase64?: unknown };
-        } catch {
-            parsed = undefined as unknown as { imageBase64?: unknown };
-        }
-        if (parsed) {
-            const bytes = parsed.imageBase64;
-            if (typeof bytes === "string" && bytes.length > 0) {
-                const mediaHash = sha256Hex(bytes);
-                parsed.imageBase64 = { $media: mediaHash };
-                split = JSON.stringify(parsed);
-                media.push({ hash: mediaHash, bytes });
-            }
-        }
-    }
-    // #4069: raw wire sidecars (rawOpenaiContent / rawOpenaiContentParts /
-    // rawResponsesItem / rawGoogleParts, …) carry the ORIGINAL part verbatim —
-    // for image parts that means the same base64 payload a second time, as a
-    // data URL. Swap every sufficiently large payload for its CAS hash, mime
-    // prefix and JSON structure untouched, so hydration is byte-identical.
-    if (split.includes(";base64,")) {
-        const byHash = new Map(media.map((m) => [m.hash, m.bytes]));
-        split = split.replace(MEDIA_URL_MARKER_RE, (_all: string, mime: string, payload: string) => {
-            const mediaHash = sha256Hex(payload);
-            if (!byHash.has(mediaHash)) {
-                byHash.set(mediaHash, payload);
-                media = [...media, { hash: mediaHash, bytes: payload }];
-            }
-            return `data:${mime};base64,{$media:${mediaHash}}`;
-        });
-    }
-    return { content: split, hash: sha256Hex(split), media };
-}
-
 interface LogEntry {
     seq: number;
     msgId: string;
     content: string;
     hash: string;
+    identity: string;
     role: string;
     kind: string;
     ref: string | null;
@@ -200,12 +152,16 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
         const entry = { msgId: m.id, content: split.content, hash: split.hash, role: parsed.role, kind: parsed.contentType ?? "message", media: split.media };
-        const key = `${m.id}\u0000${entry.hash}`;
+        // #4390: the cross-save JOIN key is the POSITION-INDEPENDENT identity
+        // (stored-bytes serialization minus id/wireIndex). content_hash stays
+        // the byte-faithful CAS key; only the join moves to identity.
+        const identity = identityOfStoredContent(entry.content);
+        const key = `${m.id}\u0000${identity}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
         return seq;
     };
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
@@ -308,6 +264,7 @@ export function planIngestDelta(
             msgId: m.id,
             content: split.content,
             hash: split.hash,
+            identity: identityOfStoredContent(split.content),
             role: parsed.role,
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
@@ -353,19 +310,37 @@ function finishPlan(
         kind: e.kind,
         content: e.content,
         contentHash: e.hash,
+        identity: e.identity,
         ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
     }));
+
+    // #4316 layer 3: the ledger positions of a block's covered messages —
+    // min/max seq over the rows its coverage resolves to. Ghost ids (no row
+    // in this plan's log) are skipped; a block whose coverage resolves to no
+    // row keeps the -1/-1 "unknown bounds" shape (pre-layer-3
+    // rows stored 0/0 placeholders; both are simply "no interval evidence"). These bounds are the durable interval form of coverage:
+    // independent of message ids, so byte churn can never invalidate them.
+    const seqById = new Map<string, number>();
+    for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
         const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
+        let startSeq = -1;
+        let endSeq = -1;
+        for (const id of b.effectiveMessageIds) {
+            const s = seqById.get(id);
+            if (s === undefined) continue;
+            if (startSeq === -1 || s < startSeq) startSeq = s;
+            if (s > endSeq) endSeq = s;
+        }
         return {
             blockId: b.blockId,
             ord,
-            startSeq: 0,
-            endSeq: 0,
+            startSeq,
+            endSeq,
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,
@@ -416,7 +391,12 @@ function finishPlan(
 
     const sessionRow: SessionRow = {
         sessionId: session.id,
-        parentSessionId: null,
+        // #4390: fork lineage into the unified row — the envelope's
+        // metadata.derivedFromSessionId (written by handle.ts at fork time)
+        // used to be the ONLY carrier; envelope loss orphaned the family.
+        parentSessionId: typeof session.metadata.derivedFromSessionId === "string" && session.metadata.derivedFromSessionId.length > 0
+            ? session.metadata.derivedFromSessionId
+            : null,
         forkPointSeq: null,
         protocol: typeof session.meta.protocol === "string" ? session.meta.protocol : null,
         label: typeof session.meta.label === "string" ? session.meta.label : null,
@@ -500,6 +480,8 @@ export function loadLegacyView(
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
     contentStore?: LegacySessionLike["contentStore"];
+    /** #4390: tail/pluginSnapshot pointers whose backing row is missing. */
+    tailGaps?: number;
 } {
     const s = rows.session;
     const kstate = JSON.parse(s.kstateJson) as Record<string, unknown>;
@@ -569,19 +551,27 @@ export function loadLegacyView(
     }
 
     const messagesBySeq = new Map(rows.messages.map((m) => [m.seq, JSON.parse(m.content) as CoreMessage]));
-    const lastMessages = tail.tailSeqs
-        ? tail.tailSeqs.map((seq) => messagesBySeq.get(seq)).filter((m): m is CoreMessage => m !== undefined)
-        : undefined;
-    const pluginSnapshot = tail.pluginSnapshotSeqs
-        ? tail.pluginSnapshotSeqs
-              .map((seq) => messagesBySeq.get(seq))
-              .filter((m): m is CoreMessage => m !== undefined)
-        : undefined;
+    // #4390: a tail pointer whose row is gone used to be silently filtered
+    // out — the view shrank with no trace. Count the gaps so callers can
+    // warn (persist logs them); the surviving members still load.
+    let tailGaps = 0;
+    const resolveSeqs = (seqs: number[]): CoreMessage[] => {
+        const out: CoreMessage[] = [];
+        for (const seq of seqs) {
+            const m = messagesBySeq.get(seq);
+            if (m === undefined) tailGaps++;
+            else out.push(m);
+        }
+        return out;
+    };
+    const lastMessages = tail.tailSeqs ? resolveSeqs(tail.tailSeqs) : undefined;
+    const pluginSnapshot = tail.pluginSnapshotSeqs ? resolveSeqs(tail.pluginSnapshotSeqs) : undefined;
 
     const out: ReturnType<typeof loadLegacyView> = {
         id: s.sessionId,
         createdAt: s.createdAt,
         lastSeen: s.updatedAt,
+        tailGaps,
         meta: JSON.parse(s.metaJson),
         stats: JSON.parse(s.statsJson),
         metadata: JSON.parse(s.metadataJson),

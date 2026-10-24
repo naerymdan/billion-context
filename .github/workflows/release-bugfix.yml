@@ -125,6 +125,14 @@ jobs:
           [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
           echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
 
+      - name: Check plugin manifest versions (#4449)
+        # Same gate as release.yml: the carve-out PR head is a frozen tree
+        # (last tag + fix + bump), so it must ALREADY carry the synced plugin
+        # manifests — drift fails fast here instead of shipping a release whose
+        # marketplace update detection never fires. See reference/release.md.
+        if: steps.resolve.outputs.proceed == 'true'
+        run: node scripts/sync-codex-plugin-version.mjs --check
+
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'
         run: |
@@ -288,3 +296,16 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
+
+      - name: Close the patch-train cycle (notice — the state is derived, nothing to clear)
+        # Dual-lane model: the open train is DERIVED (newest bugfix-release/*
+        # strictly above the latest v* tag), never stored — GITHUB_TOKEN
+        # cannot touch the actions-variables API, which is why the earlier
+        # variable pointer was removed. Publishing just created the tag that
+        # catches up to the train's base version, so the train auto-derives
+        # as closed: the next 'backport' label cuts a fresh train from the
+        # new tag (fully automatic lifecycle, zero stored state).
+        if: steps.resolve.outputs.proceed == 'true'
+        run: |
+          BRANCH="${{ steps.resolve.outputs.branch }}"
+          echo "::notice::shipped '$BRANCH' — the fresh tag closes the patch-train cycle by derivation; the next 'backport' label cuts a fresh train"

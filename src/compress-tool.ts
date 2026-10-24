@@ -720,11 +720,12 @@ export function withMarkerIntegrityNote(text: string, visibilityMarkers = true):
 const SUMMARY_BUDGET_NOTE =
     "\n\n[Per-summary length budget: every compress summary has a hard character cap, and a single oversized summary fails the WHOLE compress call — nothing gets folded. Dense content (many subagent results, long tool outputs) tempts you into writing one giant summary for a big range; don't. When a range is large or dense, SPLIT it into several smaller ranges at logical boundaries and give EACH its own concise, scannable summary, then batch all the ranges in one compress call (content: [{startId,endId,summary}, {…}]). Prefer several tight blocks over one bloated block: each stays under the cap, and smaller blocks are cheaper to re-send and independently searchable/decompressible.]";
 
-/** Append the per-summary length-budget rule to a nudge or system-prompt text.
- *  The budget note is unconditional (like withMarkerIntegrityNote): the cap
- *  always exists, so the guidance must be present whenever compression is
- *  possible. The external-summary disclosure is per-request, decided by the
- *  caller from the request's resolved Config. */
+/** Append the per-summary length-budget rule to a nudge or system-prompt text,
+ *  whenever the model writes the committed summary. In external-summary mode
+ *  (decided per request by the caller from the resolved Config) it gets the
+ *  external-summary disclosure instead: the model's summary is only a hint the
+ *  kernel never checks against the cap (the service's output is), so the
+ *  budget rule cannot apply (#4460). */
 export function withSummaryBudgetNote(text: string, external: boolean): string {
-    return text + SUMMARY_BUDGET_NOTE + (external ? EXTERNAL_SUMMARY_NOTE : "");
+    return text + (external ? EXTERNAL_SUMMARY_NOTE : SUMMARY_BUDGET_NOTE);
 }

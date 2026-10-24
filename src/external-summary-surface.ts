@@ -1,3 +1,4 @@
+import type { CompressPromptSections } from "acp-kernel";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
 
@@ -10,6 +11,17 @@ export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversati
  *  so no consumer re-reads the config file. */
 export function externalSummaryEnabled(config: unknown): boolean {
     return (config as ResolvedKernelConfig | undefined)?.externalSummary?.enabled === true;
+}
+
+/** #4460: section overrides for the CONVERSATION-side compress prompt. In
+ *  external-summary mode the conversation model only selects ranges; the
+ *  independent service writes the committed summary and gets the rules in its
+ *  own request (session.meta.summaryInstructions). The summary-writing rules
+ *  (howToCompress, ~1.5K tokens) are then dead weight on every conversation
+ *  request, so the section is dropped there. Philosophy (when to compress)
+ *  stays. Never apply this to the summary request's own instructions. */
+export function conversationPromptSections(sections: CompressPromptSections | undefined, external: boolean): CompressPromptSections | undefined {
+    return external ? { ...sections, howToCompress: null } : sections;
 }
 
 /** Upper bound (ms) on how long the proxy needs to execute a summary-producing

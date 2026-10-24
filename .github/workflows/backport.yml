@@ -1,0 +1,270 @@
+name: Backport
+
+# Dual-lane release model (owner-approved 2026-10-24): the patch train.
+#
+# Small fixes merge to master as ordinary PRs (nothing about the normal lane
+# changes). When the human wants a fix to ALSO ride the fast patch lane, they
+# add the `backport` label BEFORE clicking merge. This workflow then:
+#
+#   - derives the open train and cherry-picks the PR's own commits onto it;
+#   - cuts a train automatically when none is open: bugfix-release/v{NEXT}-train
+#     from the latest released v* tag (NEXT = patch+1), then backports — the
+#     full-lifecycle automation the owner asked for ("能自动化吗", 2026-10-24
+#     session; restored on top of c5df0ebf with that in-thread approval).
+#
+# THE OPEN TRAIN IS DERIVED, NEVER STORED: the newest bugfix-release/* branch
+# whose BASE version (suffix stripped) is strictly above the latest v* tag.
+# Cutting one = pushing such a branch; publishing makes the tag catch up, so
+# the train auto-derives as closed. There is deliberately NO Actions variable
+# pointing at it: GITHUB_TOKEN cannot read/write the actions-variables API
+# (403 "Resource not accessible by integration" — no permissions-block
+# category grants it), which is how the variable-based first version failed
+# on its maiden run (#4465, run 40053876329). Derivation needs only git refs
+# and cannot go stale.
+#
+# Why a fresh train per cycle instead of one fixed branch: each train is born
+# from a tag, so its content is STRUCTURALLY "tag + fixes" — an accidental
+# master merge or leftover commits can never poison future patch releases,
+# and an abandoned cycle leaves no state behind.
+#
+# Why cherry-pick and not a merge of the fix branch: the fix branch is based
+# on master, so a git merge into the tag-based train would carry EVERY master
+# commit since the tag (the unreleased features) over the merge-base — the
+# exact leak this lane exists to prevent.
+#
+# Merge-shape policy: only MERGE-COMMIT merges are supported (this repo's
+# convention — see git log). Squash and rebase merges rewrite the PR's commits
+# into new SHAs on master; for a multi-commit rebase, picking only the final
+# commit would SILENTLY backport part of the fix (CI green, release ships an
+# incomplete patch). The bot refuses to guess: single-parent merge commits are
+# rejected with the manual command commented on the PR. Merge-commit ranges
+# that contain housekeeping merges (e.g. "Merge branch 'master' into <pr>")
+# are handled by expanding the range with --no-merges: those merge commits
+# carry no unique content (both parents' content is accounted for individually
+# or excluded by the M^1 boundary), so dropping them loses nothing.
+#
+# CI signal on the train (#772): pushes made with GITHUB_TOKEN deliver NO
+# push events, so this workflow explicitly dispatches ci.yml on the train ref
+# after pushing. Shipping is separately gated: release-bugfix.yml dispatches
+# the FULL matrix at the train PR head before publish.
+#
+# Conflict policy: a cherry-pick that does not apply cleanly is the objective
+# signal that the fix is NOT independent of master's unreleased work — the
+# workflow comments the manual command on the PR and fails; the fix simply
+# stays on the master (slow) lane. Rerunning the job on an already-backported
+# PR also fails (empty cherry-pick) with the same breadcrumb: harmless, the
+# train is only ever pushed from a clean pick.
+#
+# The manual dispatch (pr=<number>) is the repair path: it re-runs the
+# backport for an already-merged PR (e.g. after a workflow bug like the
+# variables-API 403) — the same merged+label gates apply.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to backport (must be merged and carry the backport label)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+# Serialize train updates: two backports landing together would race on the
+# train ref. Queued (not cancelled) — every labeled merge eventually lands.
+concurrency:
+  group: backport
+  cancel-in-progress: false
+
+jobs:
+  backport:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr || github.event.pull_request.number }}
+    steps:
+      # Read the PR live from the API (works for the close event AND the
+      # manual dispatch repair path; the event payload only exists for the
+      # close event).
+      - name: Gate — merged with the backport label
+        id: gate
+        run: |
+          set -euo pipefail
+          PR="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          MERGED="$(jq -r '.merged' <<<"$PR")"
+          LABELS="$(jq -r '.labels[].name' <<<"$PR" | sort | tr '\n' ' ')"
+          MERGE_SHA="$(jq -r '.merge_commit_sha' <<<"$PR")"
+          HEAD_SHA="$(jq -r '.head.sha' <<<"$PR")"
+          echo "labels: $LABELS merged: $MERGED merge_commit: $MERGE_SHA head: $HEAD_SHA"
+          if [ "$MERGED" != "true" ] || [ -z "$MERGE_SHA" ] || [ "$MERGE_SHA" = "null" ]; then
+            echo "::error::PR #$PR_NUMBER is not merged — nothing to backport"
+            exit 1
+          fi
+          echo "merge_sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+          echo "pr_head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          if grep -qw backport <<<"$LABELS"; then
+            echo "labeled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "labeled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no backport label — master lane only, nothing to do"
+          fi
+
+      - name: Checkout (full history + tags)
+        if: steps.gate.outputs.labeled == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve the open train (derived; computes the next one if none)
+        id: resolve
+        if: steps.gate.outputs.labeled == 'true'
+        run: |
+          set -euo pipefail
+          # The derivation needs the bugfix-release namespace + tags; fetch
+          # explicitly so it never depends on what checkout happened to pull.
+          git fetch -q origin '+refs/heads/bugfix-release/*:refs/remotes/origin/bugfix-release/*' --tags
+          LAST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+          if [ -z "$LAST" ]; then echo "::error::no v* tags found — cannot derive the train state"; exit 1; fi
+          NEWEST="$(git for-each-ref --sort=-v:refname --format='%(refname:short)' 'refs/remotes/origin/bugfix-release/*' | sed 's|^origin/||' | head -1 || true)"
+          TRAIN=""
+          if [ -n "$NEWEST" ]; then
+            NB="${NEWEST#bugfix-release/v}"; TB="${LAST#v}"
+            # Compare BASE versions (strip any -suffix): after a ship the tag
+            # equals the train's base, so the train must derive as CLOSED —
+            # comparing raw strings would rank "0.1.206-train" above the tag
+            # "0.1.206" and wrongly reopen it.
+            NBB="${NB%%-*}"; TBB="${TB%%-*}"
+            TOP="$(printf '%s\n%s\n' "$NBB" "$TBB" | sort -V | tail -1)"
+            if [ "$NBB" != "$TBB" ] && [ "$TOP" = "$NBB" ]; then
+              TRAIN="$NEWEST"
+            fi
+          fi
+          if [ -n "$TRAIN" ]; then
+            echo "train=$TRAIN" >> "$GITHUB_OUTPUT"
+            echo "mode=pick" >> "$GITHUB_OUTPUT"
+            echo "open train: $TRAIN (latest tag: $LAST)"
+          else
+            # No train open: compute the next one — it is cut from the latest
+            # tag and the cut step below materializes it.
+            BASE="${LAST#v}"
+            IFS='.' read -r MA MI PA <<<"$BASE"
+            NEXT="$MA.$MI.$((PA + 1))"
+            TRAIN="bugfix-release/v${NEXT}-train"
+            echo "train=$TRAIN" >> "$GITHUB_OUTPUT"
+            echo "mode=cut" >> "$GITHUB_OUTPUT"
+            echo "no open train (latest tag: $LAST, newest branch: ${NEWEST:-none}) — will cut $TRAIN from $LAST"
+          fi
+
+      - name: Cut a fresh train from the latest released tag
+        if: steps.gate.outputs.labeled == 'true' && steps.resolve.outputs.mode == 'cut'
+        run: |
+          set -euo pipefail
+          TRAIN="${{ steps.resolve.outputs.train }}"
+          LAST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --quiet -b "$TRAIN" "$LAST"
+          git push origin "$TRAIN"
+          echo "cut $TRAIN from $LAST"
+          gh pr comment "$PR_NUMBER" --body "No patch train was open — cut \`$TRAIN\` from \`$LAST\` automatically and backporting this fix onto it. Ship it any time: Actions → Release (one-click) → tick \`train\` (\`reference/release.md\`, \"Dual-lane releases\")." || true
+
+      - name: Reject squash/rebase merge shapes — manual backport required
+        id: shape
+        if: steps.gate.outputs.labeled == 'true' && !failure()
+        run: |
+          set -euo pipefail
+          MERGE_SHA="${{ steps.gate.outputs.merge_sha }}"
+          PR_HEAD="${{ steps.gate.outputs.pr_head }}"
+          PARENTS="$(git rev-list --parents -n1 "$MERGE_SHA" | wc -w)"
+          if [ "$PARENTS" -lt 3 ]; then
+            gh pr comment "$PR_NUMBER" --body "This PR was merged via squash or rebase, not a merge commit (the repo convention). The bot only auto-backports merge-commit merges: for these rewritten shapes it cannot safely tell a complete squash apart from a multi-commit rebase — picking just the final commit would silently ship a PARTIAL fix on the train. Manual backport: \`git checkout ${{ steps.resolve.outputs.train }} && git cherry-pick -x \$(git rev-list --reverse --no-merges ${MERGE_SHA}^1..${PR_HEAD})\`. The fix stays fully on the master lane either way." || true
+            echo "::error::non-merge-commit merge shape — refusing to guess the commit set; see PR comment"
+            exit 1
+          fi
+
+      - name: Cherry-pick the PR commits onto the train
+        id: pick
+        if: steps.gate.outputs.labeled == 'true' && !failure()
+        env:
+          TRAIN: ${{ steps.resolve.outputs.train }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          MERGE_SHA="${{ steps.gate.outputs.merge_sha }}"
+          # The train branch is fetched explicitly (the merge commit needs no
+          # fetch: post-merge, the merge's first parent is the master tip
+          # that contains it).
+          if ! git rev-parse --verify --quiet "origin/$TRAIN" >/dev/null; then
+            git fetch origin "$TRAIN"
+          fi
+          # M^1..M^2 is exactly the PR's own commits; --no-merges drops
+          # housekeeping merges inside the PR branch (they carry no unique
+          # content), --reverse gives oldest-first pick order.
+          COMMITS="$(git rev-list --reverse --no-merges "${MERGE_SHA}^1..${MERGE_SHA}^2")"
+          if [ -z "$COMMITS" ]; then
+            gh pr comment "$PR_NUMBER" --body "Backport skipped: the PR contained no non-merge commits — nothing to put on \`$TRAIN\`." || true
+            exit 0
+          fi
+          git checkout --quiet -B train "origin/$TRAIN"
+          git cherry-pick -x $COMMITS
+          # Receipt data BEFORE the push: origin/$TRAIN still points at the
+          # pre-pick train head, so this range is exactly the picked commits
+          # (newest first for the comment). After the push the range would be
+          # empty (origin/$TRAIN == HEAD).
+          PICKED_LOG="$(git log --oneline "origin/$TRAIN..HEAD")"
+          git push origin HEAD:"$TRAIN"
+          {
+            echo "picked<<RECEIPT_PICKS_EOF"
+            printf '%s\n' "$PICKED_LOG"
+            echo "RECEIPT_PICKS_EOF"
+            echo "head_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch CI on the train head (#772 — token pushes carry no push events)
+        if: steps.gate.outputs.labeled == 'true' && success()
+        env:
+          TRAIN: ${{ steps.resolve.outputs.train }}
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml --ref "$TRAIN"
+          echo "::notice::CI dispatched on $TRAIN (CORE matrix)"
+
+      - name: Audit trail comment
+        if: steps.gate.outputs.labeled == 'true' && success()
+        env:
+          TRAIN: ${{ steps.resolve.outputs.train }}
+          PICKED: ${{ steps.pick.outputs.picked }}
+          HEAD_SHA: ${{ steps.pick.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          TRAIN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${TRAIN}"
+          CI_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/ci.yml?query=branch%3A${TRAIN//\//%2F}"
+          SHIP_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/release-manual.yml"
+          PICKED_MD="$(printf '%s\n' "$PICKED" | sed -n '1,10p' | sed 's/^/`/; s/ /` — /')"
+          gh pr comment "$PR_NUMBER" --body "## 🚂 Backported to the Patch Train
+
+          This fix was cherry-picked onto the open patch train [\`$TRAIN\`]($TRAIN_URL) — head \`${HEAD_SHA:0:10}\`.
+          
+          **Picked commits:**
+          $PICKED_MD
+          
+          CI is running on the train head — [runs]($CI_URL).
+          
+          **What ships when this train departs:** the next patch release (\`v$(printf '%s' "${TRAIN#bugfix-release/v}" | sed 's/-train$//')\`) containing ONLY tag-based fixes like this one — master's unreleased work stays out. To ship it now: [Release (one-click)]($SHIP_URL) → tick \`train\`." || true
+
+      - name: Conflict breadcrumb — manual backport needed
+        if: steps.gate.outputs.labeled == 'true' && failure() && steps.shape.outcome != 'failure'
+        env:
+          TRAIN: ${{ steps.resolve.outputs.train }}
+        run: |
+          set -euo pipefail
+          MERGE_SHA="${{ steps.gate.outputs.merge_sha }}"
+          gh pr comment "$PR_NUMBER" --body "Backport to \`$TRAIN\` did not complete — either the cherry-pick conflicts (the fix is NOT independent of master's unreleased work), the run is a duplicate rerun, the train branch is stale/misconfigured, or the CI dispatch failed AFTER a successful push (check the train log before retrying anything — see the job log). The fix stays on the master (slow) lane either way. To force it onto the train, resolve manually: \`git checkout $TRAIN && git cherry-pick -x \$(git rev-list --reverse --no-merges ${MERGE_SHA}^1..${MERGE_SHA}^2)\`." || true

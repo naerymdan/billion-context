@@ -369,6 +369,7 @@ export class UnifiedShadow {
                     refs: this.sync.getRefs(legacy.id),
                 };
                 const replayed = loadLegacyView(rows);
+                warnTailGaps(legacy.id, replayed);
                 const expectView = { ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) };
                 const gotView = { ...replayed, blockContents: orderedBlockContents(replayed.blockContents) };
                 const expect = shadowDigest(expectView);
@@ -514,7 +515,9 @@ export class UnifiedShadow {
             // The view's `state` object carries every MERGE_STATE_FIELDS key by
             // construction; the declared Record<string, unknown> just needs a
             // widening cast to reach LegacySessionLike.
-            return loadLegacyView(rows) as LegacySessionLike;
+            const unified = loadLegacyView(rows) as LegacySessionLike;
+            warnTailGaps(id, unified as unknown as { tailGaps?: number });
+            return unified;
         } catch (err) {
             loggerLog("warn", `[storage] unified load failed for ${id} (${String(err)}) — falling back to the legacy file`);
             return null;
@@ -912,13 +915,15 @@ export class UnifiedShadow {
                 const backend = this.backend!;
                 const sessionRow = await backend.getSessionRow(id);
                 if (!sessionRow) return null;
-                return loadLegacyView({
+                const loaded = loadLegacyView({
                     session: sessionRow,
                     messages: await backend.getMessages(id),
                     blocks: await backend.getBlocks(id),
                     deadRefs: await backend.getDeadRefs(id),
                     refs: await backend.getRefs(id),
                 }) as LegacySessionLike;
+                warnTailGaps(id, loaded as unknown as { tailGaps?: number });
+                return loaded;
             } catch (err) {
                 loggerLog("warn", `[storage] unified load failed for ${id} (${String(err)}) — falling back to the legacy file`);
                 return null;
@@ -1091,6 +1096,15 @@ export class UnifiedShadow {
     }
 }
 
+/** #4390: tail/pluginSnapshot pointers whose backing row is gone used to be
+ *  silently dropped — the view shrank with no trace (legacy tail 缺行静默
+ *  缩水). Make it loud: every load path reports the gap count. */
+function warnTailGaps(id: string, view: { tailGaps?: number }): void {
+    if ((view.tailGaps ?? 0) > 0) {
+        loggerLog("warn", `[storage] ${view.tailGaps} tail pointer(s) for ${id} reference missing rows — view is shorter than the recorded tail (#4390)`);
+    }
+}
+
 function shadowDigest(view: unknown): string {
     return sha256(JSON.stringify(canonicalize(view)));
 }
@@ -1127,6 +1141,10 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
     const ser = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(canonicalize(v)));
     const keys: string[] = [];
     for (const k of [...new Set([...Object.keys(e), ...Object.keys(g)])].sort()) {
+        // tailGaps is read-time diagnostic metadata, not parity surface (#4390) —
+        // the live legacy leg structurally lacks the key, so it must never be
+        // named as a diverged dimension (a real gap diverges lastMessages itself).
+        if (k === "tailGaps") continue;
         if (ser(e[k]) !== ser(g[k])) keys.push(k);
     }
     const diagnostics: DriftDiagnostics = { keys };

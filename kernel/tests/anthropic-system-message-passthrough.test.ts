@@ -105,7 +105,10 @@ test("one core per system wire message, role system, wireIndex kept", () => {
   assert.match(systems[1]!.text as string, /\[tool_addition\]$/);
 });
 
-test("system message between two user turns does not merge them", () => {
+test("system message between two user turns heals to user (#4457)", () => {
+  // [user, system, user] is positionally illegal on the anthropic wire —
+  // the backstop re-voices it (tool blocks stripped per WC-022) instead of
+  // forwarding a request Anthropic guarantees to 400.
   const body = {
     messages: [
       { role: "user", content: [{ type: "text", text: "a" }] },
@@ -114,7 +117,19 @@ test("system message between two user turns does not merge them", () => {
     ],
   };
   const rebuilt = coreToAnthropic(anthropicToCore(body as never).msgs as never);
-  assert.deepEqual(rebuilt, body.messages);
+  assert.deepEqual(rebuilt, [
+    { role: "user", content: [{ type: "text", text: "a" }] },
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: 'Updated system prompt section "tools":\n<tools>…</tools>',
+        },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "b" }] },
+  ]);
 });
 
 test("string-content system message round-trips", () => {

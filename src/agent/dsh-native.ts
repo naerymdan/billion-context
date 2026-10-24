@@ -800,8 +800,12 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     // not write the newer world's register/state.
     const gen = originGen;
     // #1365: routed evidence outranks the planned origin — probe where the
-    // model channel actually points, not where the env says it should.
-    const home = state.routedOrigin ?? attachOrigin;
+    // model channel actually points, not where the env says it should. An
+    // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
+    // endpoint directly, and a routed model origin may be a plain model-only
+    // path (e.g. an admin-gated port) that never exposes the plugin manifest.
+    const explicitAttachOrigin = nativeAttachOrigin(process.env);
+    const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (gen !== originGen) return undefined;
     if (version !== undefined) {
@@ -834,7 +838,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         }
         return spawnFallback(attachOrigin, `attach target ${home} rotated out (was v${version}) — spawning the current build`, gen);
     }
-    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    const pinned = explicitAttachOrigin ?? state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (gen !== originGen) return undefined;
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
@@ -846,7 +850,11 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
             persistClientEvent(`attach target ${pinned} recovered while waiting — attached, no second instance spawned`);
             return back;
         }
-        persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
+        persistClientEvent(
+            explicitAttachOrigin !== undefined
+                ? `explicit attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance; re-checks continue`
+                : `attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`,
+        );
         // #3380: only the origin dies here — the host-context tool
         // registrations survive, so toolsReady stays put.
         if (landingOwnsRegister(attachOrigin)) {

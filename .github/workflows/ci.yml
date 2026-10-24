@@ -9,9 +9,17 @@ on:
     # PRs are gated there) (#772). Note: pushes made with GITHUB_TOKEN from
     # within Actions deliver NO push events — for those, the one-click
     # workflow compensates via workflow_dispatch below.
-    branches: [master, "*_release-v*"]
+    # Patch trains (dual-lane release model, 2026-10-24): human pushes to a
+    # bugfix-release/** train get the CORE matrix directly; backport.yml's
+    # token pushes compensate by dispatching this workflow on the train ref.
+    branches: [master, "*_release-v*", "bugfix-release/**"]
   pull_request:
-    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
+    # agent-relay: #3468 agent PRs target the relay branch.
+    # bugfix-release/**: PRs INTO a train (manual fixes landing on the train
+    # directly, and the train's own ship PR lives under pull_request→master
+    # anyway) run the CORE matrix; the full-suite gate at ship time is
+    # release-bugfix.yml's dispatch, not this trigger.
+    branches: [master, agent-relay, "bugfix-release/**"]
     # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).

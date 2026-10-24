@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
+import { identityOfStoredContent } from "./identity.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
 import type { MessageContentStore } from "acp-kernel";
@@ -100,6 +101,12 @@ export interface MessageRow {
      *  content CAS, refcounted via message_media rows). Ingest-only —
      *  readers always receive hydrated content. */
     media?: { hash: string; bytes: string }[];
+    /** #4390: position-independent identity (stored-bytes serialization
+     *  minus id/wireIndex) — the cross-save JOIN key. content_hash stays
+     *  the byte-faithful CAS key; identity is what remap/sweep/guard join
+     *  on, so a client head-truncation (wireIndex shift) no longer re-mints
+     *  the surviving generation. Optional for direct callers. */
+    identity?: string;
 }
 
 export interface BlockRow {
@@ -622,11 +629,14 @@ export class UnifiedStore {
                 // at nothing and the read view would drop it. One indexed
                 // probe per NEW message; any hit → full ingest instead.
                 const existingIdentity = this.db.prepare(
-                    "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ?",
+                    "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ?",
                 );
                 for (const m of input.messages) {
                     if (!m.contentHash) return false;
-                    if (existingIdentity.get(s.sessionId, m.msgId, m.contentHash)) return false;
+                    // #4390: join on identity (position-independent). Retired
+                    // rows count as existing — a rewind-redo falls back to the
+                    // full path, which reactivates the tombstone in place.
+                    if (existingIdentity.get(s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content))) return false;
                 }
                 // Placeholder→absolute renumber: the plan emitted
                 // watermark+1.. under the aligned assumption; anchoring at
@@ -680,26 +690,39 @@ export class UnifiedStore {
                 if (opts?.completeLog === true && !this.hasLaneExt(s.sessionId)) {
                     const incomingIds = new Set<string>();
                     for (const m of messages) {
-                        incomingIds.add(`${m.msgId}\u0000${m.contentHash ?? sha256Hex(m.content)}`);
+                        incomingIds.add(`${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`);
                     }
                     const staleRows = this.db
-                        .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-                        .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+                        .prepare("SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?")
+                        .all(s.sessionId) as { seq: number; msg_id: string; identity: string; retired_at: number | null }[];
                     for (const row of staleRows) {
-                        if (incomingIds.has(`${row.msg_id}\u0000${row.content_hash}`)) continue;
-                        // #4242 delete-on-zero discipline: remove the
-                        // referencing rows FIRST, then release the hashes —
-                        // a release that hits zero now DELETEs the content
-                        // row, which an FK-referencing leftover row would
-                        // reject. (Media mappings ride the message sweep,
-                        // #3762 review.)
-                        const staleMedia = this.db
-                            .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
-                            .all(s.sessionId, row.seq) as { media_hash: string }[];
-                        this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
-                        this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
-                        this.releaseContent(row.content_hash);
-                        for (const mm of staleMedia) this.releaseContent(mm.media_hash);
+                        if (incomingIds.has(`${row.msg_id}\u0000${row.identity}`)) {
+                            // #4390 rewind-redo: the identity came back —
+                            // reactivate the tombstone at its original seq.
+                            if (row.retired_at !== null) {
+                                this.db
+                                    .prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?")
+                                    .run(s.sessionId, row.seq);
+                            }
+                            continue;
+                        }
+                        // #4390 historian sweep: the row is absent from the
+                        // authoritative set — RETIRE it, don't delete. The
+                        // unified store is the durable record of everything
+                        // the client ever sent; a rewind/undo that drops a
+                        // message from the view must tombstone it, not
+                        // destroy the bytes (epoch-gate replays #3644 and
+                        // rewind-redo both need the row to still exist —
+                        // reactivation above restores it at the same seq).
+                        // Retired rows leave the unified replay (getMessages
+                        // filters them) so drift healing and the DIGEST
+                        // reconcile keep working exactly as the DELETE did.
+                        // CAS refs are NOT released: retired rows still own
+                        // their bytes. deleteSession/archiveSession/GC own
+                        // the physical lifecycle from here.
+                        this.db
+                            .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL")
+                            .run(Date.now(), s.sessionId, row.seq);
                     }
                 }
             }
@@ -775,9 +798,9 @@ export class UnifiedStore {
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
-                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
-                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash);
+                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content));
                 if (res.changes === 0) {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
@@ -813,7 +836,41 @@ export class UnifiedStore {
                 this.releaseContent(stale.summary_hash);
                 if (stale.one_hash !== null) this.releaseContent(stale.one_hash);
             }
+            // #4316 layer 3: resolve each block's coverage to canonical seq
+            // bounds from the append-only transcript. Final absolute seqs exist
+            // only here (delta placeholders are renumbered in-transaction), so
+            // the pure planner cannot know them. Coverage whose ids have no
+            // transcript row (imported pre-fold) keeps the 0 placeholder.
+            const seqSpanById = new Map<string, [number, number]>();
+            if (input.blocks.length > 0) {
+                const rows = this.db
+                    .prepare("SELECT msg_id, seq FROM messages WHERE session_id = ?")
+                    .all(s.sessionId) as Array<{ msg_id: string; seq: number }>;
+                for (const r of rows) {
+                    const cur = seqSpanById.get(r.msg_id);
+                    if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
+                    else {
+                        if (r.seq < cur[0]) cur[0] = r.seq;
+                        if (r.seq > cur[1]) cur[1] = r.seq;
+                    }
+                }
+            }
+            const boundsForCovered = (payloadJson: string): [number, number] => {
+                let lo = Number.POSITIVE_INFINITY;
+                let hi = -1;
+                try {
+                    const cov = JSON.parse(payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) {
+                        const sp = seqSpanById.get(id);
+                        if (!sp) continue;
+                        if (sp[0] < lo) lo = sp[0];
+                        if (sp[1] > hi) hi = sp[1];
+                    }
+                } catch { /* malformed payload: keep the 0 placeholder */ }
+                return hi < 0 ? [0, 0] : [lo, hi];
+            };
             for (const b of input.blocks) {
+                const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
                 const summaryHash = this.putContent(b.summary);
                 const oneHash = b.one === null ? null : this.putContent(b.one);
                 // Re-ingest of the same block id replaces the row (dry-run
@@ -886,8 +943,8 @@ export class UnifiedStore {
                         b.blockId,
                         s.sessionId,
                         b.ord,
-                        b.startSeq,
-                        b.endSeq,
+                        bStartSeq,
+                        bEndSeq,
                         b.startRef,
                         b.endRef,
                         b.tier,
@@ -984,12 +1041,21 @@ export class UnifiedStore {
         // stable absolute seqs: same identity (msgId + content hash)
         // keeps its old seq; new identities continue after max(seq).
         const existing = this.db
-            .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-            .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null }[];
         const seqByIdentity = new Map<string, number>();
+        const hashBySeq = new Map<number, string>();
+        const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of existing) {
-            seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
+            // #4390: identity join — same logical message keeps its seq even
+            // when its bytes were re-minted with shifted wire positions.
+            // Retired rows still claim their seq (INSERT OR IGNORE would
+            // silently drop a re-mint over their PK) and reactivation below
+            // clears the tombstone when the identity comes back.
+            if (row.retired_at !== null) retiredSeqs.push(row.seq);
+            seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, row.seq);
+            hashBySeq.set(row.seq, row.content_hash);
             if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
         }
         // #3133 watermark gate (full path): the watermark names the abs seq
@@ -999,19 +1065,44 @@ export class UnifiedStore {
         // when the plan carries no tail (envelope-only imports): the next
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
+        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
-            const hash = m.contentHash ?? sha256Hex(m.content);
-            const key = `${m.msgId}\u0000${hash}`;
+            const key = `${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`;
             let abs = seqByIdentity.get(key);
             if (abs === undefined) {
                 abs = nextSeq++;
                 seqByIdentity.set(key, abs);
+            } else {
+                // #4390 review: identity match + changed bytes (a wireIndex
+                // re-mint after head truncation, sidecar drift, or external
+                // CAS corruption) — INSERT OR IGNORE would silently keep the
+                // stored generation forever: the parity oracle then drifts on
+                // every sampled save (stale wireIndex vs live view) and the
+                // heal path can never converge. Adopt the fresher bytes at
+                // the SAME seq instead: seq stability (D4-1) is preserved,
+                // the replay matches the authoritative view again, and a
+                // corrupted row heals on the next full ingest.
+                const fresh = m.contentHash ?? sha256Hex(m.content);
+                const stored = hashBySeq.get(abs);
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        for (const r of repairs) {
+            this.putContent(r.content, r.to);
+            this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?").run(r.to, s.sessionId, r.seq);
+            this.releaseContent(r.from);
+        }
+        // #4390: a rewound message that comes back reactivates in place —
+        // the tombstone clears, the original seq is reused, and the view
+        // heals without a duplicate row even on completeLog-less saves.
+        for (const seq of retiredSeqs) {
+            const back = messages.some((m) => m.seq === seq);
+            if (back) this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?").run(s.sessionId, seq);
+        }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
             seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
         const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
@@ -1547,9 +1638,11 @@ export class UnifiedStore {
         }
         if (opts.vacuum === "full") {
             loggerLog("info", "[#3901] gc: running full VACUUM (this can take a while on large databases)");
-            this.db.exec("VACUUM");
+            // #4390: delegate to vacuum() — a bare VACUUM leaves the compacted
+            // image in the WAL; only the TRUNCATE checkpoint shrinks the files.
+            this.vacuum("full");
         } else if (opts.vacuum === "incremental") {
-            this.db.exec("PRAGMA incremental_vacuum");
+            this.vacuum("incremental");
         }
         return { archived, contentRowsDeleted };
     }
@@ -2003,9 +2096,16 @@ export class UnifiedStore {
         };
     }
 
-    getMessages(sessionId: string): (MessageRow & { contentHash: string })[] {
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
+        // #4390: retired rows (rewound/undo history) stay out of the unified
+        // replay by default — they are history, not view. Callers that need
+        // the full historian record (export/diagnostics) opt in.
         const rows = this.db
-            .prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq")
+            .prepare(
+                opts?.includeRetired === true
+                    ? "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? ORDER BY seq"
+                    : "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq",
+            )
             .all(sessionId) as Record<string, unknown>[];
         return rows.map((r) => ({
             seq: r.seq as number,
@@ -2015,6 +2115,7 @@ export class UnifiedStore {
             role: r.role as string,
             kind: r.kind as string,
             contentHash: r.content_hash as string,
+            retiredAt: (r.retired_at as number | null) ?? null,
             content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
         }));
     }

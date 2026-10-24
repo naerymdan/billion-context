@@ -7,6 +7,8 @@
 // KEEP IN SYNC: adding a process-spawning suite means adding it here (the
 // tripwire fails CI until you do); slot = index here.
 export const LIVE_FILES = [
+    "tests/codex-mcp-shell.test.ts",
+    "tests/codex-plugin-version-sync.test.ts",
     "tests/session-transient-memory.test.ts",
     "tests/auto-restart.test.ts",
     "tests/bounded-storage-scale.test.ts",

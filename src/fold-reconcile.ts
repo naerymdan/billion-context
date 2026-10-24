@@ -136,6 +136,7 @@ import { simhashHex, hammingHex } from "./affinity-simhash.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
+import { log as loggerLog } from "./logger.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -369,6 +370,10 @@ interface ReconciliationPlan {
      *  caller's write-back (foldAnchorOrder / foldPositions rolling copy). */
     newOrder: string[];
     nextCanon: string[] | undefined;
+    /** #4390 p3: stored positional copy present with matching lengths but ids
+     *  not 1:1 aligned with the order backbone → Pass 0 self-disabled. Flagged
+     *  for the caller to log (the planner core stays pure). */
+    pass0Desync?: boolean;
     /** #3641 census of the RESIDUAL unmatched (after every claim pass,
      * including the shape pass): `absentEverywhere` = no unclaimed inbound
      * candidate carries loose word evidence (the content is truly off the
@@ -747,9 +752,16 @@ export function planReconciliation(
     // Pass 0's old-side coordinate system is only valid when the stored copy's
     // ids align 1:1 with the order backbone. Self-contained storage makes the
     // check exact: a desync (backbone semantics drift, partial write) disables
-    // Pass 0 instead of silently misaligning fingerprints.
-    const stored = positions !== undefined && positions.ids.length === oldOrder.length && positions.canon.length === oldOrder.length
-        && positions.ids.every((id, i) => id === oldOrder[i]) ? positions.canon : undefined;
+    // Pass 0 instead of silently misaligning fingerprints. #4390 p3: flag it —
+    // the caller logs; this core stays pure.
+    let stored: string[] | undefined;
+    if (positions !== undefined && positions.ids.length === oldOrder.length && positions.canon.length === oldOrder.length) {
+        if (positions.ids.every((id, i) => id === oldOrder[i])) {
+            stored = positions.canon;
+        } else {
+            plan.pass0Desync = true;
+        }
+    }
     const canon: string[] = [];
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
@@ -1539,6 +1551,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    if (plan.pass0Desync) {
+        loggerLog("warn", `[fold-reconcile] Pass 0 disabled: stored positional copy desynced from order backbone (session=${session.id}, copyIds=${positions?.ids.length ?? -1}, backbone=${oldOrder.length})`);
+    }
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
